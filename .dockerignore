@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+venv/
+*.ipynb
+*.ipynb_checkpoints/
+# Don't copy large data files into image — mount as volumes instead
+data/
+checkpoints/
+logs/
+*.pt
+*.bin
+*.safetensors

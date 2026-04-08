@@ -1,0 +1,172 @@
+# BioKG-LoRA Docker Compose
+#
+# Usage:
+#   docker compose up kg          # Stage 0: Build KG (CPU-intensive, no GPU needed)
+#   docker compose up rotate      # Stage 1: Train RotatE embeddings
+#   docker compose up projection  # Stage 2: Train projection layer
+#   docker compose up lora        # Stage 3: Fine-tune with LoRA
+#   docker compose up pipeline    # All stages (0 → 1 → 2 → 3)
+#   docker compose run predict    # Interactive prediction mode
+
+version: "3.9"
+
+x-common: &common
+  image: biokg-lora:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: app
+  volumes:
+    # Persistent data: raw data must be placed here before running Stage 0
+    - ./data:/workspace/biokg/data
+    # Persistent checkpoints
+    - ./checkpoints:/workspace/biokg/checkpoints
+    # Persistent logs
+    - ./logs:/workspace/biokg/logs
+    # HuggingFace model cache (avoids re-downloading on restart)
+    - hf_cache:/workspace/hf_cache
+  environment:
+    - PYTHONPATH=/workspace/biokg
+    - HF_HOME=/workspace/hf_cache
+    - TRANSFORMERS_CACHE=/workspace/hf_cache/transformers
+    # Set your HuggingFace token if using gated models (Llama)
+    - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+  restart: "no"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Individual stage services
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # Stage 0: KG construction + QA generation (CPU-only, heavy RAM)
+  kg:
+    <<: *common
+    container_name: biokg_stage0
+    command: ["--stage", "0"]
+    # No GPU needed for Stage 0
+    deploy:
+      resources:
+        limits:
+          memory: 32g
+
+  # Stage 1: RotatE embedding training (GPU, 2-3 days)
+  rotate:
+    <<: *common
+    container_name: biokg_stage1
+    command: ["--stage", "1"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Resume RotatE from checkpoint
+  rotate-resume:
+    <<: *common
+    container_name: biokg_stage1_resume
+    command: ["--stage", "1", "--resume"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Stage 2: Projection layer training (GPU, ~2 hours)
+  projection:
+    <<: *common
+    container_name: biokg_stage2
+    command: ["--stage", "2"]
+    depends_on:
+      rotate:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Stage 3: LoRA fine-tuning (GPU, 4-6 hours)
+  lora:
+    <<: *common
+    container_name: biokg_stage3
+    command: ["--stage", "3"]
+    depends_on:
+      projection:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Resume LoRA from checkpoint
+  lora-resume:
+    <<: *common
+    container_name: biokg_stage3_resume
+    command: ["--stage", "3", "--resume"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Full pipeline: all stages from scratch
+  pipeline:
+    <<: *common
+    container_name: biokg_pipeline
+    command: ["--from-scratch"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Evaluation only (no training)
+  eval:
+    <<: *common
+    container_name: biokg_eval
+    command: ["--eval-only"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Interactive prediction (docker compose run predict --predict "...")
+  predict:
+    <<: *common
+    container_name: biokg_predict
+    stdin_open: true
+    tty: true
+    entrypoint: ["python", "train.py"]
+    command: []
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Named volumes
+# ─────────────────────────────────────────────────────────────────────────────
+
+volumes:
+  hf_cache:
+    driver: local

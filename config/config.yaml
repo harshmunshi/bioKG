@@ -1,0 +1,189 @@
+# BioKG-LoRA Configuration
+# All stages are controlled from this file
+
+# ============================================================
+# PATHS
+# ============================================================
+paths:
+  data_root: "data"
+  raw_data:
+    mgi: "data_old/mgi"
+    go: "data_old/ontologies"    # GAF file is mgi_go.gaf here
+    kegg: "data_old/kegg"        # not present — Stage 0 will skip gracefully
+    string: "data_old/string"
+    gtex: "data_old/gtex"        # not present — Stage 0 will skip gracefully
+  kg:
+    graph: "data/kg/biological_kg.pt"
+    entity2id: "data/kg/entity2id.json"
+    relation2id: "data/kg/relation2id.json"
+    entity_types: "data/kg/entity_types.json"
+    triples_train: "data/kg/triples_train.pt"
+    triples_val: "data/kg/triples_val.pt"
+    triples_test: "data/kg/triples_test.pt"
+    entity_embeddings: "data/kg/entity_embeddings.pt"
+    relation_embeddings: "data/kg/relation_embeddings.pt"
+  qa:
+    train: "data/qa/train.jsonl"
+    val: "data/qa/val.jsonl"
+    test: "data/qa/test.jsonl"
+  checkpoints:
+    rotate: "checkpoints/rotate"
+    projection: "checkpoints/projection"
+    lora: "checkpoints/lora"
+  logs: "logs"
+  hf_cache: null             # null = default ~/.cache/huggingface; override e.g. "/scratch/hf_cache"
+
+# ============================================================
+# KNOWLEDGE GRAPH (Stage 0)
+# ============================================================
+kg:
+  entity_types:
+    gene: 0
+    pathway: 1
+    go_term: 2
+    phenotype: 3
+    tissue: 4
+    protein: 5
+  relation_types:
+    regulates: 0
+    regulated_by: 1
+    part_of: 2
+    has_part: 3
+    expressed_in: 4
+    expresses: 5
+    causes: 6
+    caused_by: 7
+    interacts_with: 8
+    located_in: 9
+    location_of: 10
+    has_function: 11
+    function_of: 12
+    participates_in: 13
+    associated_with: 14
+  string_confidence_threshold: 400  # Min STRING score (out of 1000)
+  gtex_expression_threshold: 1.0    # Min TPM for expressed_in edge
+  val_split: 0.05
+  test_split: 0.05
+
+# ============================================================
+# ROTATE TRAINING (Stage 1)
+# ============================================================
+rotate:
+  embedding_dim: 256         # Must be even (split into 128 complex dims)
+  margin: 9.0                # Gamma for margin-based loss
+  epsilon: 2.0               # Init scale
+  negative_sample_size: 128  # Negatives per positive (64 head + 64 tail)
+  adversarial_temperature: 1.0  # Alpha for self-adversarial weighting
+  regularization: 0.01       # L2 regularization weight
+
+  # Training
+  batch_size: 1024
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  max_epochs: 500
+  eval_every: 10             # Evaluate every N epochs
+  save_every: 50
+
+  # Scheduler
+  lr_scheduler: "plateau"    # "plateau" or "cosine"
+  lr_patience: 5
+  lr_factor: 0.5
+
+  # Evaluation
+  eval_k_list: [1, 3, 10]
+
+# ============================================================
+# PROJECTION TRAINING (Stage 2)
+# ============================================================
+projection:
+  kg_dim: 256
+  hidden_dim: 1024
+  lm_dim: 4096               # Llama-3-8B hidden size
+  dropout: 0.1
+  temperature: 0.07          # InfoNCE temperature
+
+  # Training
+  batch_size: 512
+  learning_rate: 1.0e-3
+  weight_decay: 0.01
+  max_epochs: 10
+  warmup_steps: 50
+
+# ============================================================
+# LORA FINE-TUNING (Stage 3)
+# ============================================================
+lora:
+  base_model: "meta-llama/Llama-3-8B"   # or "mistralai/Mistral-7B-v0.1"
+  quantization: "4bit"                   # "4bit", "8bit", or null
+  load_in_4bit: true
+
+  # LoRA adapter
+  lora_rank: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+  bias: "none"
+
+  # KG augmentation
+  kg_weight: 0.3             # Alpha for weighted fusion
+  entity_linking_threshold: 0.85  # Min confidence for entity linking
+
+  # Training
+  batch_size: 4
+  gradient_accumulation_steps: 8   # Effective batch = 32
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  max_steps: 5000
+  warmup_steps: 100
+  max_seq_length: 2048
+  gradient_clipping: 1.0
+
+  # Scheduler
+  lr_scheduler: "cosine"
+
+  # Saving
+  save_steps: 500
+  eval_steps: 500
+  logging_steps: 10
+
+# ============================================================
+# DATASET GENERATION
+# ============================================================
+dataset:
+  train_size: 10000
+  val_size: 1000
+  test_size: 500
+
+  # QA template distribution
+  template_weights:
+    gene_phenotype: 0.30       # 3000
+    phenotype_gene: 0.20       # 2000
+    clinical_parameter: 0.25   # 2500
+    multi_hop: 0.15            # 1500
+    comparative: 0.10          # 1000
+
+  # For multi-hop: max path length
+  max_hop_depth: 3
+
+# ============================================================
+# EVALUATION
+# ============================================================
+evaluation:
+  rouge_types: ["rouge1", "rouge2", "rougeL"]
+  entity_mention_threshold: 0.85
+  generation:
+    max_new_tokens: 512
+    temperature: 0.7
+    top_p: 0.9
+    do_sample: true
+
+# ============================================================
+# HARDWARE
+# ============================================================
+hardware:
+  num_workers: 0             # 0 = main process only (avoids CUDA fork issues on servers)
+  pin_memory: true
+  fp16: false                # Use fp16 training (for Stage 1)
+  bf16: true                 # Use bf16 training (better for Ampere GPUs)
+  seed: 42
+  gpu_id: null               # null = use all visible GPUs; set to 0/1/etc. to pin a specific GPU

@@ -1,0 +1,38 @@
+# ── Data & artifacts — managed by DVC, not git ───────────────────────────────
+# DVC tracks these via *.dvc pointer files (which ARE committed to git).
+# Run `dvc pull` to restore the actual files after cloning.
+/data_old/mgi/
+/data_old/ontologies/
+/data_old/string/
+/data/kg/
+/data/qa/
+/checkpoints/
+
+# Binary model weights (large, tracked via DVC)
+*.pt
+*.bin
+*.safetensors
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── HuggingFace cache ─────────────────────────────────────────────────────────
+hf_cache/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# ── Env ───────────────────────────────────────────────────────────────────────
+.env
+.venv/
+venv/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store

@@ -1,0 +1,8 @@
+# Minimal dependencies for Stage 0 (KG construction + QA generation)
+# Works on MacBook — no GPU, no LLM required
+torch>=2.2.0          # CPU build is fine, used only for saving .pt files
+numpy>=1.26.0
+pandas>=2.2.0
+obonet>=1.0.0         # Parse go.obo / mpo.obo
+pyyaml>=6.0.1
+tqdm>=4.66.0

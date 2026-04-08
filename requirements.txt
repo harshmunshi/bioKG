@@ -1,0 +1,34 @@
+# ── Core ML ───────────────────────────────────────────────────────────────────
+torch>=2.2.0
+torchvision>=0.17.0
+
+# ── HuggingFace stack ─────────────────────────────────────────────────────────
+transformers>=4.40.0
+peft>=0.10.0
+accelerate>=0.30.0
+bitsandbytes>=0.43.0          # 4-bit / 8-bit quantisation (QLoRA)
+datasets>=2.19.0
+
+# ── Knowledge Graph / Graph ML ────────────────────────────────────────────────
+torch-geometric>=2.5.0        # KG data structures
+obonet>=1.0.0                 # Parse .obo ontology files
+
+# ── Data science ──────────────────────────────────────────────────────────────
+numpy>=1.26.0
+pandas>=2.2.0
+scikit-learn>=1.4.0
+scipy>=1.13.0
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+rouge-score>=0.1.2
+
+# ── Config & CLI ──────────────────────────────────────────────────────────────
+pyyaml>=6.0.1
+
+# ── Logging & monitoring ──────────────────────────────────────────────────────
+tensorboard>=2.16.0
+tqdm>=4.66.0
+
+# ── Optional (KEGG API access, dev tools) ────────────────────────────────────
+# requests>=2.31.0
+# biopython>=1.83

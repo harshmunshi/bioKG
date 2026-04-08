@@ -1,0 +1,15 @@
+[core]
+    autostage = true
+    remote = s3remote
+
+# ── Push (requires AWS credentials) ──────────────────────────────────────────
+#   export AWS_ACCESS_KEY_ID=...
+#   export AWS_SECRET_ACCESS_KEY=...
+#   dvc push
+['remote "s3remote"']
+    url = s3://biokg-data-lora/biokg-lora
+
+# ── Pull (no credentials needed — bucket is public-read) ─────────────────────
+#   dvc pull
+['remote "s3remote-public"']
+    url = https://biokg-data-lora.s3.amazonaws.com/biokg-lora
