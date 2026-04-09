@@ -7,6 +7,11 @@
 #   docker compose up lora        # Stage 3: Fine-tune with LoRA
 #   docker compose up pipeline    # All stages (0 → 1 → 2 → 3)
 #   docker compose run predict    # Interactive prediction mode
+#
+# GPU selection (override at runtime or set in .env):
+#   GPU_ID=0 docker compose up rotate        # use GPU 0 (default)
+#   GPU_ID=1 docker compose up lora          # use GPU 1
+#   GPU_ID=0,1 docker compose up pipeline    # use GPUs 0 and 1
 
 version: "3.9"
 
@@ -31,7 +36,21 @@ x-common: &common
     - TRANSFORMERS_CACHE=/workspace/hf_cache/transformers
     # Set your HuggingFace token if using gated models (Llama)
     - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    # GPU selection — controls which physical GPU(s) the container sees.
+    # Set GPU_ID in .env or inline: GPU_ID=1 docker compose up rotate
+    - NVIDIA_VISIBLE_DEVICES=${GPU_ID:-0}
+    - CUDA_VISIBLE_DEVICES=${GPU_ID:-0}
   restart: "no"
+
+# GPU device fragment — referenced by every GPU-using service
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ["${GPU_ID:-0}"]
+            capabilities: [gpu]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Individual stage services
@@ -52,116 +71,60 @@ services:
 
   # Stage 1: RotatE embedding training (GPU, 2-3 days)
   rotate:
-    <<: *common
+    <<: [*common, *gpu]
     container_name: biokg_stage1
     command: ["--stage", "1"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 
   # Resume RotatE from checkpoint
   rotate-resume:
-    <<: *common
+    <<: [*common, *gpu]
     container_name: biokg_stage1_resume
     command: ["--stage", "1", "--resume"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 
   # Stage 2: Projection layer training (GPU, ~2 hours)
   projection:
-    <<: *common
+    <<: [*common, *gpu]
     container_name: biokg_stage2
     command: ["--stage", "2"]
     depends_on:
       rotate:
         condition: service_completed_successfully
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 
   # Stage 3: LoRA fine-tuning (GPU, 4-6 hours)
   lora:
-    <<: *common
+    <<: [*common, *gpu]
     container_name: biokg_stage3
     command: ["--stage", "3"]
     depends_on:
       projection:
         condition: service_completed_successfully
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 
   # Resume LoRA from checkpoint
   lora-resume:
-    <<: *common
+    <<: [*common, *gpu]
     container_name: biokg_stage3_resume
     command: ["--stage", "3", "--resume"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 
   # Full pipeline: all stages from scratch
   pipeline:
-    <<: *common
+    <<: [*common, *gpu]
     container_name: biokg_pipeline
     command: ["--from-scratch"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 
   # Evaluation only (no training)
   eval:
-    <<: *common
+    <<: [*common, *gpu]
     container_name: biokg_eval
     command: ["--eval-only"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 
   # Interactive prediction (docker compose run predict --predict "...")
   predict:
-    <<: *common
+    <<: [*common, *gpu]
     container_name: biokg_predict
     stdin_open: true
     tty: true
     entrypoint: ["python", "train.py"]
     command: []
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Named volumes
