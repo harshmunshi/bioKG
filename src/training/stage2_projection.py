@@ -30,6 +30,9 @@ def run(cfg: Dict, resume: bool = False) -> None:
         cfg:    full config dict
         resume: resume from checkpoint if available
     """
+    from src.utils.model_profile import resolve_model_profile
+    model_profile = resolve_model_profile(cfg)
+
     paths = cfg["paths"]
     proj_cfg = cfg["projection"]
     hw_cfg = cfg["hardware"]
@@ -80,7 +83,7 @@ def run(cfg: Dict, resume: bool = False) -> None:
     projection = KGProjectionLayer(
         kg_dim=proj_cfg["kg_dim"],
         hidden_dim=proj_cfg["hidden_dim"],
-        lm_dim=proj_cfg["lm_dim"],
+        lm_dim=model_profile["lm_dim"],
         dropout=proj_cfg["dropout"],
     ).to(device)
 

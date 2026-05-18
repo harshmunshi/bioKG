@@ -93,12 +93,26 @@ rotate:
   eval_k_list: [1, 3, 10]
 
 # ============================================================
+# MODEL PROFILES
+# Defines model-specific settings used across stages.
+# Switch active model by changing lora.base_model below.
+# lm_dim: verify against HuggingFace model config.json hidden_size.
+# ============================================================
+model_profiles:
+  "meta-llama/Llama-3-8B":
+    lm_dim: 4096
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+  "google/gemma-4-e2b-it":
+    lm_dim: 2048              # Verify from HF model card (gemma-4 2B hidden_size)
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+
+# ============================================================
 # PROJECTION TRAINING (Stage 2)
 # ============================================================
 projection:
   kg_dim: 256
   hidden_dim: 1024
-  lm_dim: 4096               # Llama-3-8B hidden size
+  lm_dim: null               # null = auto-resolved from model_profiles[lora.base_model]
   dropout: 0.1
   temperature: 0.07          # InfoNCE temperature
 
@@ -113,7 +127,7 @@ projection:
 # LORA FINE-TUNING (Stage 3)
 # ============================================================
 lora:
-  base_model: "meta-llama/Llama-3-8B"   # or "mistralai/Mistral-7B-v0.1"
+  base_model: "google/gemma-4-e2b-it"   # or "meta-llama/Llama-3-8B"
   quantization: "4bit"                   # "4bit", "8bit", or null
   load_in_4bit: true
 
@@ -121,7 +135,7 @@ lora:
   lora_rank: 32
   lora_alpha: 64
   lora_dropout: 0.05
-  target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+  target_modules: null   # null = auto-resolved from model_profiles[base_model]
   bias: "none"
 
   # KG augmentation

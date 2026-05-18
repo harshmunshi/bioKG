@@ -2,10 +2,10 @@
 BioKG-LoRA: Knowledge Graph Enhanced LLM with LoRA adapters (Stage 3).
 
 Architecture:
-    1. Base LLM (Llama-3-8B or Mistral-7B)  — frozen, loaded in 4-bit
-    2. RotatE KG embeddings                  — frozen (from Stage 1)
-    3. KG → LM Projection layer             — trainable (from Stage 2)
-    4. LoRA adapters on attention layers     — trainable
+    1. Base LLM (Llama-3-8B or gemma-4-e2b-it)  — frozen, loaded in 4-bit
+    2. RotatE KG embeddings                       — frozen (from Stage 1)
+    3. KG → LM Projection layer                  — trainable (from Stage 2)
+    4. LoRA adapters on attention layers          — trainable
 
 Only ~0.5% of parameters are trained (projection + LoRA adapters).
 """
@@ -51,17 +51,18 @@ class BioKGLoRA(nn.Module):
 
     def __init__(
         self,
-        base_model_name: str = "meta-llama/Llama-3-8B",
+        base_model_name: str = "google/gemma-4-e2b-it",
         kg_embedding_path: Optional[str] = None,
         entity2id_path: Optional[str] = None,
         projection_ckpt: Optional[str] = None,
         kg_dim: int = 256,
-        lm_dim: int = 4096,
+        lm_dim: int = 2048,
         kg_weight: float = 0.3,
         lora_rank: int = 32,
         lora_alpha: int = 64,
         lora_dropout: float = 0.05,
         quantization: Optional[str] = "4bit",
+        target_modules: Optional[List[str]] = None,
     ):
         super().__init__()
         self.kg_weight = kg_weight
@@ -87,8 +88,9 @@ class BioKGLoRA(nn.Module):
             logger.info("Loaded projection layer from %s", projection_ckpt)
 
         # ── 4. Apply LoRA adapters ───────────────────────────────────────────
+        _target_modules = target_modules or ["q_proj", "v_proj", "k_proj", "o_proj"]
         self.base_llm = self._apply_lora(
-            self.base_llm, lora_rank, lora_alpha, lora_dropout
+            self.base_llm, lora_rank, lora_alpha, lora_dropout, _target_modules
         )
 
     # ── Loading helpers ───────────────────────────────────────────────────────
@@ -129,7 +131,7 @@ class BioKGLoRA(nn.Module):
         )
 
     @staticmethod
-    def _apply_lora(model, rank: int, alpha: int, dropout: float):
+    def _apply_lora(model, rank: int, alpha: int, dropout: float, target_modules: List[str]):
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
         # Prepare quantised model for training
@@ -139,7 +141,7 @@ class BioKGLoRA(nn.Module):
             r=rank,
             lora_alpha=alpha,
             lora_dropout=dropout,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            target_modules=target_modules,
             bias="none",
             task_type="CAUSAL_LM",
         )

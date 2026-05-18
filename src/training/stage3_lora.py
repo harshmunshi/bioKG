@@ -77,6 +77,9 @@ def run(cfg: Dict, resume: bool = False) -> None:
     kg_emb_path = str(kg_dir / "entity_embeddings.pt")
 
     from src.models.biokg_lora import BioKGLoRA
+    from src.utils.model_profile import resolve_model_profile
+
+    model_profile = resolve_model_profile(cfg)
 
     model = BioKGLoRA(
         base_model_name=lora_cfg["base_model"],
@@ -84,12 +87,13 @@ def run(cfg: Dict, resume: bool = False) -> None:
         entity2id_path=entity2id_path if Path(entity2id_path).exists() else None,
         projection_ckpt=proj_ckpt if Path(proj_ckpt).exists() else None,
         kg_dim=cfg["projection"]["kg_dim"],
-        lm_dim=cfg["projection"]["lm_dim"],
+        lm_dim=model_profile["lm_dim"],
         kg_weight=lora_cfg.get("kg_weight", 0.3),
         lora_rank=lora_cfg["lora_rank"],
         lora_alpha=lora_cfg["lora_alpha"],
         lora_dropout=lora_cfg["lora_dropout"],
         quantization=lora_cfg.get("quantization"),
+        target_modules=model_profile["target_modules"],
     )
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
