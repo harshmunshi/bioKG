@@ -1,0 +1,6 @@
+outs:
+- md5: f87b2723c22773882f439fb3a3696c83.dir
+  size: 198449032
+  nfiles: 3
+  hash: md5
+  path: ontologies

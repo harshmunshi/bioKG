@@ -1,0 +1,6 @@
+outs:
+- md5: 6c7dead7b3e1f18f06523d01379fcb2a.dir
+  size: 131965971
+  nfiles: 2
+  hash: md5
+  path: mgi

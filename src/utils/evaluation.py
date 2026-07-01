@@ -4,6 +4,7 @@ Evaluation utilities for BioKG-LoRA.
 Covers:
     - Link prediction (MRR, Hits@K) for RotatE (Stage 1)
     - Embedding clustering quality (Stage 1 validation)
+    - Projection alignment (nearest-neighbour retrieval) for Stage 2
     - ROUGE-L, perplexity for language model (Stage 3)
     - Entity mention accuracy (Stage 3)
 """
@@ -159,6 +160,57 @@ def evaluate_embedding_clustering(
                     group_name, intra_sim, rand_sim, lift)
 
     return results
+
+
+# ── Stage 2: Projection Alignment ────────────────────────────────────────────
+
+@torch.no_grad()
+def evaluate_projection_alignment(
+    projection,
+    kg_embs: torch.Tensor,      # (N, kg_dim)
+    lm_embs: torch.Tensor,      # (N, lm_dim)
+    device: torch.device,
+    batch_size: int = 512,
+) -> Dict[str, float]:
+    """
+    Nearest-neighbour retrieval accuracy for the projection layer.
+
+    For each entity, projects its KG embedding and ranks the corresponding LM
+    embedding among all N LM embeddings by cosine similarity.  A perfect
+    projection would always rank the true target first (Recall@1 = 1.0).
+
+    Returns:
+        projection_mrr, projection_recall@1/5/10
+    """
+    projection.eval()
+    N = kg_embs.shape[0]
+    lm_norm = F.normalize(lm_embs.to(device).float(), dim=-1)   # (N, lm_dim)
+
+    ranks: List[float] = []
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        proj = F.normalize(
+            projection(kg_embs[start:end].to(device)).float(), dim=-1
+        )                                                          # (B, lm_dim)
+        sims = proj @ lm_norm.T                                   # (B, N)
+        for i in range(end - start):
+            true_idx = start + i
+            rank = int((sims[i] > sims[i, true_idx]).sum().item()) + 1
+            ranks.append(rank)
+
+    ranks_arr = np.array(ranks, dtype=np.float32)
+    metrics = {
+        "projection_mrr":       float((1.0 / ranks_arr).mean()),
+        "projection_recall@1":  float((ranks_arr <= 1).mean()),
+        "projection_recall@5":  float((ranks_arr <= 5).mean()),
+        "projection_recall@10": float((ranks_arr <= 10).mean()),
+    }
+    logger.info(
+        "Projection alignment: MRR=%.4f  R@1=%.4f  R@5=%.4f  R@10=%.4f",
+        metrics["projection_mrr"], metrics["projection_recall@1"],
+        metrics["projection_recall@5"], metrics["projection_recall@10"],
+    )
+    return metrics
 
 
 # ── Stage 3: Language Model Evaluation ───────────────────────────────────────

@@ -1,5 +1,9 @@
 # BioKG-LoRA Docker Compose
 #
+# On startup every service runs `dvc pull` automatically (via docker-entrypoint.sh)
+# before starting training.  Raw data is pulled from the public S3 remote — no
+# AWS credentials required for pull.
+#
 # Usage:
 #   docker compose up kg          # Stage 0: Build KG (CPU-intensive, no GPU needed)
 #   docker compose up rotate      # Stage 1: Train RotatE embeddings
@@ -12,6 +16,12 @@
 #   GPU_ID=0 docker compose up rotate        # use GPU 0 (default)
 #   GPU_ID=1 docker compose up lora          # use GPU 1
 #   GPU_ID=0,1 docker compose up pipeline    # use GPUs 0 and 1
+#
+# Skip dvc pull when data is already on disk (e.g. second run):
+#   SKIP_DVC_PULL=1 docker compose up lora
+#
+# AWS credentials — only needed for `dvc push` (pull is public-read):
+#   Copy .env.example to .env and fill in your keys.
 
 version: "3.9"
 
@@ -22,7 +32,9 @@ x-common: &common
     dockerfile: Dockerfile
     target: app
   volumes:
-    # Persistent data: raw data must be placed here before running Stage 0
+    # DVC-managed raw data (populated automatically by dvc pull on startup)
+    - ./data_old:/workspace/biokg/data_old
+    # Processed KG / QA data
     - ./data:/workspace/biokg/data
     # Persistent checkpoints
     - ./checkpoints:/workspace/biokg/checkpoints
@@ -34,8 +46,14 @@ x-common: &common
     - PYTHONPATH=/workspace/biokg
     - HF_HOME=/workspace/hf_cache
     - TRANSFORMERS_CACHE=/workspace/hf_cache/transformers
-    # Set your HuggingFace token if using gated models (Llama)
+    # HuggingFace token — required for gated models (Gemma, Llama)
     - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    # AWS credentials — only needed for dvc push; pull is public-read
+    - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+    - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+    - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+    # Set SKIP_DVC_PULL=1 to skip dvc pull when data is already on disk
+    - SKIP_DVC_PULL=${SKIP_DVC_PULL:-0}
     # GPU selection — controls which physical GPU(s) the container sees.
     # Set GPU_ID in .env or inline: GPU_ID=1 docker compose up rotate
     - NVIDIA_VISIBLE_DEVICES=${GPU_ID:-0}

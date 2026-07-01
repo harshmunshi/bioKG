@@ -21,6 +21,17 @@ import torch.optim as optim
 logger = logging.getLogger(__name__)
 
 
+def _make_writer(log_dir: Path):
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(log_dir=str(log_dir))
+        logger.info("TensorBoard writer → %s", log_dir)
+        return writer
+    except Exception as e:
+        logger.warning("TensorBoard unavailable (%s) — skipping", e)
+        return None
+
+
 def run(cfg: Dict, resume: bool = False) -> None:
     """
     Entry point for Stage 1.
@@ -35,6 +46,10 @@ def run(cfg: Dict, resume: bool = False) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Stage 1 (RotatE) using device: %s", device)
+
+    log_dir = Path(paths["logs"])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    writer = _make_writer(log_dir / "stage1")
 
     # ── Load KG ──────────────────────────────────────────────────────────────
     kg_dir = Path(paths["data_root"]) / "kg"
@@ -127,6 +142,10 @@ def run(cfg: Dict, resume: bool = False) -> None:
 
         logger.info("Epoch %d/%d | loss=%.4f | %.1fs",
                     epoch + 1, rot_cfg["max_epochs"], avg_loss, elapsed)
+        if writer:
+            writer.add_scalar("train/loss", avg_loss, epoch + 1)
+            writer.add_scalar("train/lr",
+                              optimizer.param_groups[0]["lr"], epoch + 1)
 
         # ── Validation ───────────────────────────────────────────────────────
         if (epoch + 1) % rot_cfg["eval_every"] == 0:
@@ -136,6 +155,9 @@ def run(cfg: Dict, resume: bool = False) -> None:
                 device=device,
             )
             print_metrics(val_metrics, title=f"Epoch {epoch+1} Validation")
+            if writer:
+                for k, v in val_metrics.items():
+                    writer.add_scalar(f"val/{k}", v, epoch + 1)
 
             if scheduler is not None:
                 _step_scheduler(scheduler, rot_cfg["lr_scheduler"], val_metrics.get("mrr", 0))
@@ -161,9 +183,26 @@ def run(cfg: Dict, resume: bool = False) -> None:
         device=device,
     )
     print_metrics(test_metrics, title="TEST SET RESULTS")
+    if writer:
+        for k, v in test_metrics.items():
+            writer.add_scalar(f"test/{k}", v, rot_cfg["max_epochs"])
 
     # ── Extract and save embeddings ───────────────────────────────────────────
-    _save_embeddings(model, kg_dir)
+    cluster_metrics = _save_embeddings(model, kg_dir)
+    if writer and cluster_metrics:
+        for group, m in cluster_metrics.items():
+            writer.add_scalar(f"clustering/{group}_lift", m["lift"],
+                              rot_cfg["max_epochs"])
+    if writer:
+        writer.close()
+
+    # ── Persist metrics to JSON ───────────────────────────────────────────────
+    all_metrics = {"test": test_metrics, "clustering": cluster_metrics or {}}
+    metrics_path = log_dir / "stage1_metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(all_metrics, f, indent=2)
+    logger.info("Metrics saved to %s", metrics_path)
+
     logger.info("Stage 1 complete. Best MRR: %.4f", best_mrr)
 
 
@@ -219,7 +258,7 @@ def _resume(model, optimizer, ckpt_dir: Path, device: torch.device) -> tuple[int
     return start, mrr
 
 
-def _save_embeddings(model, kg_dir: Path) -> None:
+def _save_embeddings(model, kg_dir: Path) -> Optional[Dict]:
     entity_embs = model.get_entity_embeddings()   # (E, d)
     relation_embs = model.get_relation_embeddings()  # (R, d/2)
     torch.save(entity_embs, str(kg_dir / "entity_embeddings.pt"))
@@ -227,14 +266,14 @@ def _save_embeddings(model, kg_dir: Path) -> None:
     logger.info("Entity embeddings saved: %s", entity_embs.shape)
     logger.info("Relation embeddings saved: %s", relation_embs.shape)
 
-    # Optional: clustering validation
     try:
-        import json
         with open(str(kg_dir / "entity2id.json"), encoding="utf-8") as f:
             entity2id = json.load(f)
         from src.utils.evaluation import evaluate_embedding_clustering
         cluster_metrics = evaluate_embedding_clustering(entity_embs, entity2id)
-        for group, metrics in cluster_metrics.items():
-            logger.info("Clustering %s: lift=%.3f", group, metrics["lift"])
+        for group, m in cluster_metrics.items():
+            logger.info("Clustering %s: lift=%.3f", group, m["lift"])
+        return cluster_metrics
     except Exception as e:
         logger.warning("Clustering eval skipped: %s", e)
+        return None

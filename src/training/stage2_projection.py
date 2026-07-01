@@ -13,13 +13,24 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 
 logger = logging.getLogger(__name__)
+
+
+def _make_writer(log_dir: Path):
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(log_dir=str(log_dir))
+        logger.info("TensorBoard writer → %s", log_dir)
+        return writer
+    except Exception as e:
+        logger.warning("TensorBoard unavailable (%s) — skipping", e)
+        return None
 
 
 def run(cfg: Dict, resume: bool = False) -> None:
@@ -39,6 +50,10 @@ def run(cfg: Dict, resume: bool = False) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Stage 2 (Projection) using device: %s", device)
+
+    log_dir = Path(paths["logs"])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    writer = _make_writer(log_dir / "stage2")
 
     # ── Load KG embeddings (frozen, from Stage 1) ─────────────────────────────
     kg_dir = Path(paths["data_root"]) / "kg"
@@ -64,17 +79,33 @@ def run(cfg: Dict, resume: bool = False) -> None:
     )  # (E, lm_dim) on CPU
     logger.info("LM embeddings pre-computed: %s", lm_embs.shape)
 
-    # ── Build DataLoader ─────────────────────────────────────────────────────
+    # ── Train / val split ────────────────────────────────────────────────────
+    val_fraction = proj_cfg.get("val_fraction", 0.1)
     all_ids = torch.arange(num_entities)
     dataset = TensorDataset(all_ids, entity_embs, lm_embs)
+
+    rng = torch.Generator().manual_seed(42)
+    n_val = max(1, int(num_entities * val_fraction))
+    n_train = num_entities - n_val
+    perm = torch.randperm(num_entities, generator=rng)
+    train_idx, val_idx = perm[:n_train], perm[n_train:]
+    logger.info("Split: %d train / %d val entities", n_train, n_val)
+
     n_workers = hw_cfg.get("num_workers", 0)
     loader = DataLoader(
-        dataset,
+        Subset(dataset, train_idx.tolist()),
         batch_size=proj_cfg["batch_size"],
         shuffle=True,
         num_workers=n_workers,
         pin_memory=(n_workers > 0),
         drop_last=True,
+    )
+    val_loader = DataLoader(
+        Subset(dataset, val_idx.tolist()),
+        batch_size=proj_cfg["batch_size"],
+        shuffle=False,
+        num_workers=n_workers,
+        pin_memory=(n_workers > 0),
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
@@ -114,6 +145,9 @@ def run(cfg: Dict, resume: bool = False) -> None:
 
     # ── Training loop ─────────────────────────────────────────────────────────
     logger.info("Starting projection training for %d epochs", proj_cfg["max_epochs"])
+    from src.utils.evaluation import evaluate_projection_alignment, print_metrics
+
+    history = []
 
     for epoch in range(start_epoch, proj_cfg["max_epochs"]):
         projection.train()
@@ -125,7 +159,7 @@ def run(cfg: Dict, resume: bool = False) -> None:
             kg_batch = kg_batch.to(device)
             lm_batch = lm_batch.to(device)
 
-            kg_projected = projection(kg_batch)   # (B, lm_dim)
+            kg_projected = projection(kg_batch)
             out = loss_fn(kg_projected, lm_batch)
             loss = out["loss"]
 
@@ -142,13 +176,45 @@ def run(cfg: Dict, resume: bool = False) -> None:
         avg_acc = epoch_acc / len(loader)
         elapsed = time.time() - t0
 
-        logger.info(
-            "Epoch %d/%d | loss=%.4f | acc=%.4f | %.1fs",
-            epoch + 1, proj_cfg["max_epochs"], avg_loss, avg_acc, elapsed,
+        # ── Validation ───────────────────────────────────────────────────────
+        val_loss, val_acc = _evaluate_val(projection, loss_fn, val_loader, device)
+
+        # Nearest-neighbour retrieval on val entities
+        val_ids_list = val_idx.tolist()
+        align_metrics = evaluate_projection_alignment(
+            projection,
+            kg_embs=entity_embs[val_ids_list],
+            lm_embs=lm_embs[val_ids_list],
+            device=device,
+        )
+        print_metrics(
+            {"val_loss": val_loss, "val_acc": val_acc, **align_metrics},
+            title=f"Epoch {epoch+1} Validation",
         )
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        logger.info(
+            "Epoch %d/%d | train_loss=%.4f | train_acc=%.4f | val_loss=%.4f | %.1fs",
+            epoch + 1, proj_cfg["max_epochs"], avg_loss, avg_acc, val_loss, elapsed,
+        )
+
+        if writer:
+            writer.add_scalar("train/loss", avg_loss, epoch + 1)
+            writer.add_scalar("train/accuracy", avg_acc, epoch + 1)
+            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch + 1)
+            writer.add_scalar("val/loss", val_loss, epoch + 1)
+            writer.add_scalar("val/accuracy", val_acc, epoch + 1)
+            for k, v in align_metrics.items():
+                writer.add_scalar(f"val/{k}", v, epoch + 1)
+
+        history.append({
+            "epoch": epoch + 1,
+            "train_loss": avg_loss, "train_acc": avg_acc,
+            "val_loss": val_loss, "val_acc": val_acc,
+            **align_metrics,
+        })
+
+        if val_loss < best_loss:
+            best_loss = val_loss
             torch.save({
                 "epoch": epoch,
                 "projection": projection.state_dict(),
@@ -156,11 +222,19 @@ def run(cfg: Dict, resume: bool = False) -> None:
                 "optimizer": optimizer.state_dict(),
                 "best_loss": best_loss,
             }, str(ckpt_dir / "best.pt"))
-            # Also save just the projection weights for easy loading in Stage 3
             torch.save(projection.state_dict(), str(ckpt_dir / "projection_weights.pt"))
-            logger.info("  ✓ New best loss=%.4f — checkpoint saved", best_loss)
+            logger.info("  ✓ New best val_loss=%.4f — checkpoint saved", best_loss)
 
-    logger.info("Stage 2 complete. Best contrastive loss: %.4f", best_loss)
+    if writer:
+        writer.close()
+
+    logger.info("Stage 2 complete. Best val loss: %.4f", best_loss)
+
+    # ── Save metrics JSON ─────────────────────────────────────────────────────
+    metrics_path = log_dir / "stage2_metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump({"history": history}, f, indent=2)
+    logger.info("Metrics saved to %s", metrics_path)
 
     # Copy projection weights to standard location
     import shutil
@@ -235,6 +309,20 @@ def _precompute_lm_embeddings(
             logger.info("  LM embedding pre-compute: %d/%d", end, num_entities)
 
     return all_lm_embs
+
+
+@torch.no_grad()
+def _evaluate_val(projection, loss_fn, val_loader, device) -> Tuple[float, float]:
+    projection.eval()
+    total_loss, total_acc, n = 0.0, 0.0, 0
+    for _, kg_batch, lm_batch in val_loader:
+        kg_batch = kg_batch.to(device)
+        lm_batch = lm_batch.to(device)
+        out = loss_fn(projection(kg_batch), lm_batch)
+        total_loss += out["loss"].item()
+        total_acc += out["accuracy"].item()
+        n += 1
+    return total_loss / max(n, 1), total_acc / max(n, 1)
 
 
 def _resume(projection, optimizer, ckpt_dir: Path, device: torch.device) -> tuple[int, float]:

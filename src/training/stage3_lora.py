@@ -14,12 +14,23 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.optim as optim
 
 logger = logging.getLogger(__name__)
+
+
+def _make_writer(log_dir: Path):
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(log_dir=str(log_dir))
+        logger.info("TensorBoard writer → %s", log_dir)
+        return writer
+    except Exception as e:
+        logger.warning("TensorBoard unavailable (%s) — skipping", e)
+        return None
 
 
 def run(cfg: Dict, resume: bool = False) -> None:
@@ -37,6 +48,10 @@ def run(cfg: Dict, resume: bool = False) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Stage 3 (LoRA fine-tuning) using device: %s", device)
+
+    log_dir = Path(paths["logs"])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    writer = _make_writer(log_dir / "stage3")
 
     # ── Tokeniser ────────────────────────────────────────────────────────────
     from transformers import AutoTokenizer
@@ -130,17 +145,20 @@ def run(cfg: Dict, resume: bool = False) -> None:
 
     # ── Training loop ─────────────────────────────────────────────────────────
     logger.info("Starting LoRA fine-tuning (max_steps=%d)", total_steps)
+    from src.utils.evaluation import evaluate_perplexity
 
     model.train()
     optimizer.zero_grad()
 
     train_iter = _infinite_loader(train_loader)
-    log_every = lora_cfg.get("logging_steps", 10)
-    eval_every = lora_cfg.get("eval_steps", 500)
-    save_every = lora_cfg.get("save_steps", 500)
+    log_every   = lora_cfg.get("logging_steps", 10)
+    eval_every  = lora_cfg.get("eval_steps", 500)
+    save_every  = lora_cfg.get("save_steps", 500)
+    rouge_every = lora_cfg.get("rouge_eval_steps", eval_every * 5)
 
     running_loss = 0.0
     t0 = time.time()
+    step_metrics: List[Dict] = []
 
     while global_step < total_steps:
         batch = next(train_iter)
@@ -156,7 +174,6 @@ def run(cfg: Dict, resume: bool = False) -> None:
         loss.backward()
         running_loss += out.loss.item()
 
-        # Gradient step
         if (global_step + 1) % accum_steps == 0:
             torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
             optimizer.step()
@@ -173,18 +190,40 @@ def run(cfg: Dict, resume: bool = False) -> None:
                 "Step %d/%d | loss=%.4f | lr=%.2e | %.1fs",
                 global_step, total_steps, avg_loss, lr, elapsed,
             )
+            if writer:
+                writer.add_scalar("train/loss", avg_loss, global_step)
+                writer.add_scalar("train/lr", lr, global_step)
             running_loss = 0.0
             t0 = time.time()
 
         if global_step % eval_every == 0:
             val_loss = _evaluate(model, val_loader, device)
-            logger.info("  Val loss: %.4f", val_loss)
+            val_ppl  = evaluate_perplexity(model, val_loader, device)
+            logger.info("  Val loss: %.4f | Val perplexity: %.2f", val_loss, val_ppl)
+            if writer:
+                writer.add_scalar("val/loss", val_loss, global_step)
+                writer.add_scalar("val/perplexity", val_ppl, global_step)
+            step_metrics.append({
+                "step": global_step,
+                "val_loss": val_loss, "val_perplexity": val_ppl,
+            })
             model.train()
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 model.save_adapters(str(ckpt_dir / "best"))
                 logger.info("  ✓ New best val loss=%.4f — saved", best_val_loss)
+
+        if global_step % rouge_every == 0:
+            rouge = _quick_rouge_eval(model, tokenizer, qa_dir, eval_cfg,
+                                      entity_linker, device, max_samples=200)
+            if rouge and writer:
+                for k, v in rouge.items():
+                    writer.add_scalar(f"val/{k}", v, global_step)
+            if rouge:
+                logger.info("  Periodic ROUGE @ step %d: %s", global_step,
+                            {k: f"{v:.4f}" for k, v in rouge.items()})
+            model.train()
 
         if global_step % save_every == 0:
             model.save_adapters(str(ckpt_dir / f"step_{global_step:06d}"))
@@ -195,8 +234,20 @@ def run(cfg: Dict, resume: bool = False) -> None:
     model.save_adapters(str(ckpt_dir / "final"))
     logger.info("Stage 3 complete. Best val loss: %.4f", best_val_loss)
 
-    # ── Final evaluation with ROUGE ───────────────────────────────────────────
-    _run_generation_eval(model, tokenizer, qa_dir, eval_cfg, entity_linker, device)
+    if writer:
+        writer.close()
+
+    # ── Final evaluation with ROUGE on full test set ──────────────────────────
+    final_metrics = _run_generation_eval(
+        model, tokenizer, qa_dir, eval_cfg, entity_linker, device
+    )
+
+    # ── Save metrics JSON ─────────────────────────────────────────────────────
+    all_metrics = {"step_metrics": step_metrics, "final": final_metrics or {}}
+    metrics_path = log_dir / "stage3_metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(all_metrics, f, indent=2)
+    logger.info("Metrics saved to %s", metrics_path)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -260,29 +311,11 @@ def _resume(model, optimizer, ckpt_dir: Path, device: torch.device) -> tuple[int
     return step, best_loss
 
 
-@torch.no_grad()
-def _run_generation_eval(model, tokenizer, qa_dir: Path, eval_cfg: Dict,
-                          entity_linker, device: torch.device) -> None:
-    """Generate answers for the test set and compute ROUGE."""
-    import json
-    from src.utils.evaluation import evaluate_rouge, evaluate_entity_mention_accuracy, print_metrics
-
-    test_path = qa_dir / "test.jsonl"
-    if not test_path.exists():
-        return
-
-    logger.info("Running generation evaluation on test set…")
-    samples = []
-    with open(test_path, encoding="utf-8") as f:
-        for line in f:
-            samples.append(json.loads(line.strip()))
-
-    # Limit to first 100 for speed
-    samples = samples[:100]
+def _generate_predictions(model, tokenizer, samples, eval_cfg, entity_linker, device):
+    """Run generation for a list of QA samples, return (predictions, references, ref_entities)."""
     predictions, references, ref_entities = [], [], []
-
-    model.eval()
     gen_cfg = eval_cfg.get("generation", {})
+    model.eval()
 
     for sample in samples:
         q = sample["question"]
@@ -310,9 +343,56 @@ def _run_generation_eval(model, tokenizer, qa_dir: Path, eval_cfg: Dict,
         references.append(sample["answer"])
         ref_entities.append(sample.get("entities", []))
 
+    return predictions, references, ref_entities
+
+
+@torch.no_grad()
+def _quick_rouge_eval(model, tokenizer, qa_dir: Path, eval_cfg: Dict,
+                       entity_linker, device: torch.device,
+                       max_samples: int = 200) -> Optional[Dict]:
+    """Lightweight mid-training ROUGE check on a subset of the validation set."""
+    from src.utils.evaluation import evaluate_rouge
+    val_path = qa_dir / "val.jsonl"
+    if not val_path.exists():
+        return None
+    samples = []
+    with open(val_path, encoding="utf-8") as f:
+        for line in f:
+            samples.append(json.loads(line.strip()))
+    samples = samples[:max_samples]
+    preds, refs, _ = _generate_predictions(
+        model, tokenizer, samples, eval_cfg, entity_linker, device
+    )
+    return evaluate_rouge(preds, refs, eval_cfg.get("rouge_types", ["rougeL"]))
+
+
+@torch.no_grad()
+def _run_generation_eval(model, tokenizer, qa_dir: Path, eval_cfg: Dict,
+                          entity_linker, device: torch.device) -> Optional[Dict]:
+    """Generate answers for the full test set and compute ROUGE + entity metrics."""
+    from src.utils.evaluation import evaluate_rouge, evaluate_entity_mention_accuracy, print_metrics
+
+    test_path = qa_dir / "test.jsonl"
+    if not test_path.exists():
+        return None
+
+    samples = []
+    with open(test_path, encoding="utf-8") as f:
+        for line in f:
+            samples.append(json.loads(line.strip()))
+    logger.info("Running final generation eval on %d test samples…", len(samples))
+
+    predictions, references, ref_entities = _generate_predictions(
+        model, tokenizer, samples, eval_cfg, entity_linker, device
+    )
+
     rouge_metrics = evaluate_rouge(predictions, references, eval_cfg.get("rouge_types", ["rougeL"]))
     print_metrics(rouge_metrics, title="Test ROUGE Scores")
+    result = dict(rouge_metrics)
 
     if entity_linker:
         entity_metrics = evaluate_entity_mention_accuracy(predictions, ref_entities, entity_linker)
         print_metrics(entity_metrics, title="Entity Mention Accuracy")
+        result.update(entity_metrics)
+
+    return result

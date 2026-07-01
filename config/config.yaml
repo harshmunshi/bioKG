@@ -114,6 +114,7 @@ projection:
   hidden_dim: 1024
   lm_dim: null               # null = auto-resolved from model_profiles[lora.base_model]
   dropout: 0.1
+  val_fraction: 0.10         # fraction of entities held out for validation
   temperature: 0.07          # InfoNCE temperature
 
   # Training
@@ -155,9 +156,10 @@ lora:
   # Scheduler
   lr_scheduler: "cosine"
 
-  # Saving
+  # Saving / evaluation
   save_steps: 500
-  eval_steps: 500
+  eval_steps: 500            # val loss + perplexity every N steps
+  rouge_eval_steps: 2500     # periodic ROUGE on 200 val samples every N steps
   logging_steps: 10
 
 # ============================================================
