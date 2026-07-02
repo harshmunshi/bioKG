@@ -107,6 +107,21 @@ docker compose up lora-resume
 
 ### Running without Docker
 
+Use [uv](https://github.com/astral-sh/uv) for local experiments (much faster than pip, and keeps a project-local venv out of the way of Docker):
+
+```bash
+# Create/sync a local venv (CPU-safe, works on MacBook)
+uv venv
+uv pip install -r requirements-stage0.txt
+
+# Full deps (requires CUDA)
+uv pip install -r requirements.txt
+
+source .venv/bin/activate
+```
+
+Or with plain pip:
+
 ```bash
 # Install Stage 0 deps only (CPU-safe, works on MacBook)
 pip install -r requirements-stage0.txt

@@ -1,0 +1,17 @@
+{
+  "regulates": 0,
+  "regulated_by": 1,
+  "part_of": 2,
+  "has_part": 3,
+  "expressed_in": 4,
+  "expresses": 5,
+  "causes": 6,
+  "caused_by": 7,
+  "interacts_with": 8,
+  "located_in": 9,
+  "location_of": 10,
+  "has_function": 11,
+  "function_of": 12,
+  "participates_in": 13,
+  "associated_with": 14
+}
