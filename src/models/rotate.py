@@ -125,6 +125,7 @@ class RotatE(nn.Module):
         head: torch.Tensor,
         relation: torch.Tensor,
         entity_chunk_size: int = 256,
+        valid_entity_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Score (head, relation) against all entities (for link prediction eval).
@@ -135,6 +136,10 @@ class RotatE(nn.Module):
             entity_chunk_size: entities scored per chunk — bounds memory to
                 O(B * entity_chunk_size) instead of O(B * num_entities), which
                 otherwise blows up for large KGs with large eval batches.
+            valid_entity_mask: (num_entities,) bool tensor — entities with
+                False are excluded from ranking (score set to +inf). Use this
+                to drop zero-degree entities that never received a gradient
+                update and would otherwise pollute the ranking with noise.
 
         Returns:
             scores: (B, num_entities)
@@ -162,6 +167,9 @@ class RotatE(nn.Module):
             re_d = re_hr.unsqueeze(1) - re_at.unsqueeze(0)
             im_d = im_hr.unsqueeze(1) - im_at.unsqueeze(0)
             scores[:, start:end] = torch.sqrt(re_d ** 2 + im_d ** 2 + 1e-8).sum(dim=-1)
+
+        if valid_entity_mask is not None:
+            scores = scores.masked_fill(~valid_entity_mask.unsqueeze(0), float("inf"))
         return scores
 
     def score_all_heads(
@@ -169,12 +177,14 @@ class RotatE(nn.Module):
         relation: torch.Tensor,
         tail: torch.Tensor,
         entity_chunk_size: int = 256,
+        valid_entity_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Score all entities as head for (?, relation, tail).
 
         Args:
             entity_chunk_size: see `score_all_tails`.
+            valid_entity_mask: see `score_all_tails`.
 
         Returns:
             scores: (B, num_entities)
@@ -202,6 +212,9 @@ class RotatE(nn.Module):
             re_d = re_ah.unsqueeze(0) - re_t_inv.unsqueeze(1)
             im_d = im_ah.unsqueeze(0) - im_t_inv.unsqueeze(1)
             scores[:, start:end] = torch.sqrt(re_d ** 2 + im_d ** 2 + 1e-8).sum(dim=-1)
+
+        if valid_entity_mask is not None:
+            scores = scores.masked_fill(~valid_entity_mask.unsqueeze(0), float("inf"))
         return scores
 
     # ── Loss ─────────────────────────────────────────────────────────────────

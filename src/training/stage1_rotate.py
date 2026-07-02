@@ -85,6 +85,15 @@ def run(cfg: Dict, resume: bool = False) -> None:
     filter_dict = {**{k: v for k, v in true_tail.items()},
                    **{k: v for k, v in true_head.items()}}
 
+    # Restrict eval ranking to entities that actually appear in the KG —
+    # entities with zero edges never get a gradient update and just add
+    # untrained noise to the ranking candidate pool otherwise.
+    valid_entity_mask = torch.zeros(num_entities, dtype=torch.bool)
+    valid_entity_mask[all_triples[:, 0]] = True
+    valid_entity_mask[all_triples[:, 2]] = True
+    logger.info("Entities with >=1 edge (used for eval ranking): %d / %d",
+                valid_entity_mask.sum().item(), num_entities)
+
     # ── Model ────────────────────────────────────────────────────────────────
     from src.models.rotate import RotatE
 
@@ -153,6 +162,8 @@ def run(cfg: Dict, resume: bool = False) -> None:
                 model, val_loader, num_entities,
                 k_list=rot_cfg.get("eval_k_list", [1, 3, 10]),
                 device=device,
+                filter_true=filter_dict,
+                valid_entity_mask=valid_entity_mask,
             )
             print_metrics(val_metrics, title=f"Epoch {epoch+1} Validation")
             if writer:
@@ -181,6 +192,8 @@ def run(cfg: Dict, resume: bool = False) -> None:
         model, test_loader, num_entities,
         k_list=rot_cfg.get("eval_k_list", [1, 3, 10]),
         device=device,
+        filter_true=filter_dict,
+        valid_entity_mask=valid_entity_mask,
     )
     print_metrics(test_metrics, title="TEST SET RESULTS")
     if writer:

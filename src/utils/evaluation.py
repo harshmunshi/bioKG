@@ -31,6 +31,7 @@ def evaluate_link_prediction(
     k_list: List[int] = [1, 3, 10],
     device: Optional[torch.device] = None,
     filter_true: Optional[Dict] = None,
+    valid_entity_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     """
     Evaluate link prediction with filtered MRR and Hits@K.
@@ -42,12 +43,17 @@ def evaluate_link_prediction(
 
     Args:
         filter_true: dict mapping (h, r) → set of true tails (for filtered eval)
+        valid_entity_mask: (num_entities,) bool tensor restricting the ranking
+            candidate pool to entities that actually appear in the KG — excludes
+            zero-degree entities that never received a gradient update.
 
     Returns:
         dict with keys: mrr, hits@1, hits@3, hits@10
     """
     if device is None:
         device = next(model.parameters()).device
+    if valid_entity_mask is not None:
+        valid_entity_mask = valid_entity_mask.to(device)
 
     model.eval()
     ranks: List[float] = []
@@ -58,7 +64,7 @@ def evaluate_link_prediction(
         t = batch["tail"].to(device)
 
         # ── Predict tail ──────────────────────────────────────────────────────
-        scores = model.score_all_tails(h, r)   # (B, E)  lower = better
+        scores = model.score_all_tails(h, r, valid_entity_mask=valid_entity_mask)   # (B, E)  lower = better
 
         for i in range(len(h)):
             true_tail = t[i].item()
@@ -76,14 +82,14 @@ def evaluate_link_prediction(
             ranks.append(rank)
 
         # ── Predict head ──────────────────────────────────────────────────────
-        scores = model.score_all_heads(r, t)   # (B, E)
+        scores = model.score_all_heads(r, t, valid_entity_mask=valid_entity_mask)   # (B, E)
 
         for i in range(len(h)):
             true_head = h[i].item()
             row = scores[i]
 
             if filter_true is not None:
-                key_inv = (t[i].item(), r[i].item())  # (tail, rel) → true heads
+                key_inv = (r[i].item(), t[i].item())  # (rel, tail) → true heads
                 true_set = filter_true.get(key_inv, set())
                 for th in true_set:
                     if th != true_head:
