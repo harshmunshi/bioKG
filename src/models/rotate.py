@@ -124,7 +124,7 @@ class RotatE(nn.Module):
         self,
         head: torch.Tensor,
         relation: torch.Tensor,
-        entity_chunk_size: int = 2048,
+        entity_chunk_size: int = 256,
     ) -> torch.Tensor:
         """
         Score (head, relation) against all entities (for link prediction eval).
@@ -168,7 +168,7 @@ class RotatE(nn.Module):
         self,
         relation: torch.Tensor,
         tail: torch.Tensor,
-        entity_chunk_size: int = 2048,
+        entity_chunk_size: int = 256,
     ) -> torch.Tensor:
         """
         Score all entities as head for (?, relation, tail).
