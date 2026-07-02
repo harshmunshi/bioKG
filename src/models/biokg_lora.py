@@ -87,6 +87,11 @@ class BioKGLoRA(nn.Module):
             self.kg_projection.load_state_dict(state)
             logger.info("Loaded projection layer from %s", projection_ckpt)
 
+        # base_llm is already placed on-device via device_map="auto" — match it,
+        # since kg_projection is a freshly created submodule that defaults to CPU.
+        embedding_device = self.base_llm.get_input_embeddings().weight.device
+        self.kg_projection = self.kg_projection.to(embedding_device)
+
         # ── 4. Apply LoRA adapters ───────────────────────────────────────────
         _target_modules = target_modules or ["q_proj", "v_proj", "k_proj", "o_proj"]
         self.base_llm = self._apply_lora(

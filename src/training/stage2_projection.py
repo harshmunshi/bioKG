@@ -264,6 +264,7 @@ def _load_frozen_llm(model_name: str, lora_cfg: Dict):
         model_name,
         quantization_config=bnb,
         device_map="auto",
+        torch_dtype=torch.bfloat16 if not bnb else None,
         trust_remote_code=True,
     )
     for p in model.parameters():
