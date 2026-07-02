@@ -124,6 +124,7 @@ class RotatE(nn.Module):
         self,
         head: torch.Tensor,
         relation: torch.Tensor,
+        entity_chunk_size: int = 2048,
     ) -> torch.Tensor:
         """
         Score (head, relation) against all entities (for link prediction eval).
@@ -131,6 +132,9 @@ class RotatE(nn.Module):
         Args:
             head:     (B,) entity IDs
             relation: (B,) relation IDs
+            entity_chunk_size: entities scored per chunk — bounds memory to
+                O(B * entity_chunk_size) instead of O(B * num_entities), which
+                otherwise blows up for large KGs with large eval batches.
 
         Returns:
             scores: (B, num_entities)
@@ -138,9 +142,9 @@ class RotatE(nn.Module):
         h = self.entity_embedding(head)      # (B, d)
         r = self.relation_embedding(relation)  # (B, d/2)
         all_t = self.entity_embedding.weight   # (E, d)
+        num_entities = all_t.shape[0]
 
         re_h, im_h = torch.chunk(h, 2, dim=-1)     # (B, d/2)
-        re_at, im_at = torch.chunk(all_t, 2, dim=-1)  # (E, d/2)
 
         phase = r / (self.margin / torch.pi)
         re_r = torch.cos(phase)   # (B, d/2)
@@ -149,19 +153,28 @@ class RotatE(nn.Module):
         re_hr = re_h * re_r - im_h * im_r   # (B, d/2)
         im_hr = re_h * im_r + im_h * re_r
 
-        # Broadcast: (B, 1, d/2) - (1, E, d/2)
-        re_d = re_hr.unsqueeze(1) - re_at.unsqueeze(0)   # (B, E, d/2)
-        im_d = im_hr.unsqueeze(1) - im_at.unsqueeze(0)
-        scores = torch.sqrt(re_d ** 2 + im_d ** 2 + 1e-8).sum(dim=-1)  # (B, E)
+        scores = torch.empty(head.shape[0], num_entities, device=head.device, dtype=re_hr.dtype)
+        for start in range(0, num_entities, entity_chunk_size):
+            end = min(start + entity_chunk_size, num_entities)
+            re_at, im_at = torch.chunk(all_t[start:end], 2, dim=-1)  # (chunk, d/2)
+
+            # Broadcast: (B, 1, d/2) - (1, chunk, d/2)
+            re_d = re_hr.unsqueeze(1) - re_at.unsqueeze(0)
+            im_d = im_hr.unsqueeze(1) - im_at.unsqueeze(0)
+            scores[:, start:end] = torch.sqrt(re_d ** 2 + im_d ** 2 + 1e-8).sum(dim=-1)
         return scores
 
     def score_all_heads(
         self,
         relation: torch.Tensor,
         tail: torch.Tensor,
+        entity_chunk_size: int = 2048,
     ) -> torch.Tensor:
         """
         Score all entities as head for (?, relation, tail).
+
+        Args:
+            entity_chunk_size: see `score_all_tails`.
 
         Returns:
             scores: (B, num_entities)
@@ -169,9 +182,9 @@ class RotatE(nn.Module):
         r = self.relation_embedding(relation)  # (B, d/2)
         t = self.entity_embedding(tail)        # (B, d)
         all_h = self.entity_embedding.weight   # (E, d)
+        num_entities = all_h.shape[0]
 
         re_t, im_t = torch.chunk(t, 2, dim=-1)
-        re_ah, im_ah = torch.chunk(all_h, 2, dim=-1)
 
         phase = r / (self.margin / torch.pi)
         re_r = torch.cos(phase)
@@ -181,9 +194,14 @@ class RotatE(nn.Module):
         re_t_inv = re_t * re_r + im_t * im_r   # (B, d/2)
         im_t_inv = im_t * re_r - re_t * im_r
 
-        re_d = re_ah.unsqueeze(0) - re_t_inv.unsqueeze(1)   # (B, E, d/2)
-        im_d = im_ah.unsqueeze(0) - im_t_inv.unsqueeze(1)
-        scores = torch.sqrt(re_d ** 2 + im_d ** 2 + 1e-8).sum(dim=-1)  # (B, E)
+        scores = torch.empty(tail.shape[0], num_entities, device=tail.device, dtype=re_t_inv.dtype)
+        for start in range(0, num_entities, entity_chunk_size):
+            end = min(start + entity_chunk_size, num_entities)
+            re_ah, im_ah = torch.chunk(all_h[start:end], 2, dim=-1)  # (chunk, d/2)
+
+            re_d = re_ah.unsqueeze(0) - re_t_inv.unsqueeze(1)
+            im_d = im_ah.unsqueeze(0) - im_t_inv.unsqueeze(1)
+            scores[:, start:end] = torch.sqrt(re_d ** 2 + im_d ** 2 + 1e-8).sum(dim=-1)
         return scores
 
     # ── Loss ─────────────────────────────────────────────────────────────────
