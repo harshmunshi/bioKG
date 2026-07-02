@@ -210,6 +210,10 @@ def setup_environment(cfg: Dict) -> None:
 
 def _validate_gpu(cfg: Dict) -> None:
     """Warn if GPU doesn't support the requested quantization / dtype."""
+    if torch.cuda.device_count() == 0:
+        logger.warning("No GPU detected — training will be very slow")
+        return
+
     for i in range(torch.cuda.device_count()):
         props = torch.cuda.get_device_properties(i)
         cc = props.major * 10 + props.minor  # compute capability × 10
@@ -229,8 +233,6 @@ def _validate_gpu(cfg: Dict) -> None:
         logger.info("GPU %d: %s  (sm_%d%d, %d MiB)",
                     i, name, props.major, props.minor,
                     props.total_memory // (1024 ** 2))
-    else:
-        logger.warning("No GPU detected — training will be very slow")
 
 
 def _check_write_access(cfg: Dict) -> None:
