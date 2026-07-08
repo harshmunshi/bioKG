@@ -337,6 +337,9 @@ def _generate_predictions(model, tokenizer, samples, eval_cfg, entity_linker, de
             temperature=gen_cfg.get("temperature", 0.7),
             top_p=gen_cfg.get("top_p", 0.9),
             do_sample=gen_cfg.get("do_sample", True),
+            repetition_penalty=gen_cfg.get("repetition_penalty", 1.3),
+            no_repeat_ngram_size=gen_cfg.get("no_repeat_ngram_size", 3),
+            eos_token_id=tokenizer.eos_token_id,
         )
         gen_text = tokenizer.decode(out_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
         predictions.append(gen_text)

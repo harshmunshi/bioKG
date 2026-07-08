@@ -49,6 +49,7 @@ class QAGenerator:
         relation2id: Dict[str, int],
         triples: torch.Tensor,
         entity_types: Dict[int, int],
+        entity_names: Optional[Dict[int, str]] = None,
         seed: int = 42,
     ):
         self.entity2id = entity2id
@@ -56,6 +57,7 @@ class QAGenerator:
         self.relation2id = relation2id
         self.id2relation: Dict[int, str] = {v: k for k, v in relation2id.items()}
         self.entity_types = entity_types  # int id → type int
+        self.entity_names = entity_names or {}  # int id → human-readable name (GO/MP terms)
         self.triples_tensor = triples
         self.rng = random.Random(seed)
 
@@ -83,6 +85,23 @@ class QAGenerator:
         self._participates_id = relation2id.get("participates_in", -1)
         self._interacts_id = relation2id.get("interacts_with", -1)
         self._has_function_id = relation2id.get("has_function", -1)
+
+        # "participates_in" edges land on GO_TERM entities in this KG (KEGG
+        # pathway data was never sourced, so the dedicated PATHWAY_TYPE is
+        # always empty) — treat GO terms as the de facto pathway/process context.
+        self._PATHWAY_LIKE_TYPES = {self._PATHWAY_TYPE, self._GO_TYPE}
+
+    # ── Naming helpers ────────────────────────────────────────────────────────
+
+    def _name(self, entity_id: int) -> str:
+        """Human-readable name if one was resolved (GO/MP terms), else the raw code."""
+        return self.entity_names.get(entity_id) or self.id2entity[entity_id]
+
+    def _display(self, entity_id: int) -> str:
+        """'CODE (name)' for ontology-coded entities, or just the symbol for genes."""
+        code = self.id2entity[entity_id]
+        name = self.entity_names.get(entity_id)
+        return f"{code} ({name})" if name else code
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -150,6 +169,13 @@ class QAGenerator:
             logger.warning("Only generated %d/%d QA pairs after %d attempts", len(qa_list), n, attempts)
         return qa_list
 
+    _GENE_PHENOTYPE_QUESTIONS = [
+        "What phenotypes are associated with {gene} knockout?",
+        "What phenotypes does {gene} knockout cause?",
+        "What happens when {gene} is knocked out?",
+        "Which phenotypes result from loss of {gene} function?",
+    ]
+
     def _gene_phenotype_qa(self) -> Optional[Dict]:
         """What phenotypes does <gene> knockout cause?"""
         genes = self._entities_of_type(self._GENE_TYPE)
@@ -163,9 +189,10 @@ class QAGenerator:
         ]
         if not phenotypes:
             return None
-        pheno_names = [self.id2entity[p] for p in phenotypes[:5]]
-        pheno_list = "\n".join(f"  - {p}" for p in pheno_names)
-        question = f"What phenotypes are associated with {gene_name} knockout?"
+        phenotypes = phenotypes[:5]
+        pheno_names = [self.id2entity[p] for p in phenotypes]
+        pheno_list = "\n".join(f"  - {self._display(p)}" for p in phenotypes)
+        question = self.rng.choice(self._GENE_PHENOTYPE_QUESTIONS).format(gene=gene_name)
         answer = (
             f"{gene_name} knockout results in the following phenotypes:\n"
             f"{pheno_list}\n\n"
@@ -179,13 +206,19 @@ class QAGenerator:
             "entities": [gene_name] + pheno_names,
         }
 
+    _PHENOTYPE_GENE_QUESTIONS = [
+        "Which genes are associated with the phenotype: {pheno}?",
+        "Which genes cause the phenotype {pheno}?",
+        "What genes, when knocked out, produce the phenotype {pheno}?",
+    ]
+
     def _phenotype_gene_qa(self) -> Optional[Dict]:
         """Which genes cause phenotype <X>?"""
         phenos = self._entities_of_type(self._PHENO_TYPE)
         if not phenos:
             return None
         pheno_id = self.rng.choice(phenos)
-        pheno_name = self.id2entity[pheno_id]
+        pheno_display = self._display(pheno_id)
         caused_by_id = self.relation2id.get("caused_by", -1)
         genes = [
             self.id2entity[t]
@@ -194,31 +227,41 @@ class QAGenerator:
         ]
         if not genes:
             return None
-        gene_list = ", ".join(genes[:5])
-        question = f"Which genes are associated with the phenotype: {pheno_name}?"
+        genes = genes[:5]
+        gene_list = ", ".join(genes)
+        question = self.rng.choice(self._PHENOTYPE_GENE_QUESTIONS).format(pheno=pheno_display)
         answer = (
-            f"The phenotype '{pheno_name}' is caused by knockout of the following genes: "
+            f"The phenotype {pheno_display} is caused by knockout of the following genes: "
             f"{gene_list}. These genes share common biological roles or pathways that "
             f"converge on this phenotypic manifestation."
         )
         return {
             "question": question,
             "answer": answer,
-            "entities": genes[:5] + [pheno_name],
+            "entities": genes + [self.id2entity[pheno_id]],
         }
+
+    _CLINICAL_PARAMETER_QUESTIONS = [
+        "What is the significance of elevated {param} in a {gene} knockout mouse?",
+        "What is the significance of '{param}' in {gene} knockout?",
+        "Why does {gene} knockout affect {param}?",
+    ]
 
     def _clinical_parameter_qa(self) -> Optional[Dict]:
         """What is the significance of elevated <param> in <gene> knockout?"""
-        # Find phenotypes that sound like clinical parameters
+        # Find phenotypes that sound like clinical parameters — match against the
+        # resolved human-readable name (bare MP: codes never contain words like
+        # "glucose", so matching the raw code here always misses).
         phenos = self._entities_of_type(self._PHENO_TYPE)
         clinical_phenos = [
             p for p in phenos
-            if any(kw.lower() in self.id2entity[p].lower() for kw in CLINICAL_PARAMS)
+            if any(kw.lower() in self._name(p).lower() for kw in CLINICAL_PARAMS)
         ]
         if not clinical_phenos:
             return None
         pheno_id = self.rng.choice(clinical_phenos)
-        pheno_name = self.id2entity[pheno_id]
+        pheno_display = self._display(pheno_id)
+        param_name = self._name(pheno_id)
         caused_by_id = self.relation2id.get("caused_by", -1)
         genes = [
             self.id2entity[t]
@@ -229,76 +272,111 @@ class QAGenerator:
             return None
         gene_name = self.rng.choice(genes)
         gene_id = self.entity2id[gene_name]
-        # Find pathways for the gene
+
+        # Functional/pathway context — "participates_in" edges land on GO_TERM
+        # entities here (no KEGG pathway data was sourced), so GO terms serve as
+        # the de facto pathway context.
         pathways = [
             self.id2entity[t]
             for r, t in self._adj.get(gene_id, [])
-            if r == self._participates_id and self.entity_types.get(t) == self._PATHWAY_TYPE
+            if r == self._participates_id and self.entity_types.get(t) in self._PATHWAY_LIKE_TYPES
         ]
-        pathway_str = f" through its role in {pathways[0]}" if pathways else ""
-        question = f"What is the significance of '{pheno_name}' in {gene_name} knockout?"
+        # Direct interaction partners give a mechanistic hop beyond the gene itself.
+        partners = [
+            self.id2entity[t]
+            for r, t in self._adj.get(gene_id, [])
+            if r == self._interacts_id and self.entity_types.get(t) == self._GENE_TYPE
+        ]
+
+        steps = [f"1. {gene_name} regulates biological processes"]
+        if pathways:
+            steps[0] += f" within {self._display(self.entity2id[pathways[0]])}"
+        step_n = 2
+        if partners:
+            steps.append(f"{step_n}. {gene_name} interacts with {partners[0]}, extending this effect mechanistically")
+            step_n += 1
+        steps.append(f"{step_n}. Loss of {gene_name} function disrupts these processes")
+        step_n += 1
+        steps.append(f"{step_n}. This connects to phenotype {pheno_display}")
+
+        related = ", ".join(self._display(self.entity2id[p]) for p in pathways[:3])
+        question = self.rng.choice(self._CLINICAL_PARAMETER_QUESTIONS).format(
+            param=param_name, gene=gene_name
+        )
         answer = (
-            f"The observation of '{pheno_name}' in {gene_name} knockout is significant "
-            f"because {gene_name} regulates biological processes{pathway_str}. "
-            f"Loss of {gene_name} function disrupts these processes, leading to the "
-            f"clinical manifestation of {pheno_name}. This phenotype serves as a "
-            f"measurable biomarker of the underlying molecular dysfunction."
+            f"Elevated {param_name} in {gene_name} knockout is significant because:\n"
+            + "\n".join(steps)
+            + (f"\nRelated pathways/processes: {related}" if related else "")
         )
         return {
             "question": question,
             "answer": answer,
-            "entities": [gene_name, pheno_name] + pathways[:2],
+            "entities": [gene_name, self.id2entity[pheno_id]] + pathways[:2] + partners[:1],
         }
 
+    _MULTI_HOP_QUESTIONS = [
+        "How does {gene} knockout lead to its observed phenotype?",
+        "What is the mechanistic pathway from {gene} knockout to its phenotype?",
+        "Explain the biological mechanism by which {gene} knockout causes phenotypic changes.",
+    ]
+
     def _multi_hop_qa(self) -> Optional[Dict]:
-        """How does <gene> affect <tissue>? — traces a 2–3 hop path."""
+        """How does <gene> knockout lead to <phenotype>? — traces a 2-3 hop mechanistic path.
+
+        Routes through interacts_with (gene-gene) and participates_in
+        (gene-GO term) rather than expressed_in/tissue: this KG has zero
+        expressed_in/tissue edges (GTEx data was never sourced), so a
+        tissue-expression-based path can never be found.
+        """
         genes = self._entities_of_type(self._GENE_TYPE)
-        tissues = self._entities_of_type(self._TISSUE_TYPE)
-        if not genes or not tissues:
+        if not genes:
             return None
         gene_id = self.rng.choice(genes)
         gene_name = self.id2entity[gene_id]
 
-        # Find tissues connected via gene → expressed_in
-        direct_tissues = [
+        partners = [
             t for r, t in self._adj.get(gene_id, [])
-            if r == self._expressed_id and self.entity_types.get(t) == self._TISSUE_TYPE
+            if r == self._interacts_id and self.entity_types.get(t) == self._GENE_TYPE
         ]
-        if not direct_tissues:
+        if not partners:
             return None
-        tissue_id = self.rng.choice(direct_tissues)
-        tissue_name = self.id2entity[tissue_id]
+        partner_id = self.rng.choice(partners)
+        partner_name = self.id2entity[partner_id]
 
-        # Find phenotypes connected to gene
+        pathways = [
+            t for r, t in self._adj.get(gene_id, [])
+            if r == self._participates_id and self.entity_types.get(t) in self._PATHWAY_LIKE_TYPES
+        ]
+
         phenos = [
-            self.id2entity[t]
-            for r, t in self._adj.get(gene_id, [])
+            t for r, t in self._adj.get(gene_id, [])
             if r == self._causes_id and self.entity_types.get(t) == self._PHENO_TYPE
         ]
-        # Find pathways
-        pathways = [
-            self.id2entity[t]
-            for r, t in self._adj.get(gene_id, [])
-            if r == self._participates_id
-        ]
+        if not phenos:
+            return None
+        pheno_id = self.rng.choice(phenos)
+        pheno_display = self._display(pheno_id)
 
-        steps = [f"1. {gene_name} is expressed in {tissue_name}"]
+        steps = [f"1. {gene_name} interacts with {partner_name}"]
+        step_n = 2
         if pathways:
-            steps.append(f"2. {gene_name} participates in {pathways[0]}")
-        if phenos:
-            steps.append(f"3. Knockout of {gene_name} causes: {', '.join(phenos[:2])}")
+            steps.append(f"{step_n}. This interaction occurs within {self._display(pathways[0])}")
+            step_n += 1
+        steps.append(f"{step_n}. Knockout of {gene_name} disrupts this interaction")
+        step_n += 1
+        steps.append(f"{step_n}. This leads to phenotype {pheno_display}")
 
-        question = f"How does {gene_name} knockout affect {tissue_name}?"
+        question = self.rng.choice(self._MULTI_HOP_QUESTIONS).format(gene=gene_name)
         answer = (
-            f"{gene_name} knockout affects {tissue_name} through the following pathway:\n"
+            f"{gene_name} knockout leads to {pheno_display} through the following mechanistic path:\n"
             + "\n".join(steps)
-            + f"\n\nThis multi-step cascade explains why {tissue_name} is impacted when "
-            + f"{gene_name} function is lost."
+            + f"\n\nThis multi-step cascade explains the observed phenotype when {gene_name} function is lost."
         )
         return {
             "question": question,
             "answer": answer,
-            "entities": [gene_name, tissue_name] + pathways[:1] + phenos[:2],
+            "entities": [gene_name, partner_name, self.id2entity[pheno_id]]
+            + [self.id2entity[p] for p in pathways[:1]],
         }
 
     def _comparative_qa(self) -> Optional[Dict]:
@@ -310,13 +388,11 @@ class QAGenerator:
         g1, g2 = self.id2entity[g1_id], self.id2entity[g2_id]
 
         phenos1 = set(
-            self.id2entity[t]
-            for r, t in self._adj.get(g1_id, [])
+            t for r, t in self._adj.get(g1_id, [])
             if r == self._causes_id and self.entity_types.get(t) == self._PHENO_TYPE
         )
         phenos2 = set(
-            self.id2entity[t]
-            for r, t in self._adj.get(g2_id, [])
+            t for r, t in self._adj.get(g2_id, [])
             if r == self._causes_id and self.entity_types.get(t) == self._PHENO_TYPE
         )
         if not phenos1 or not phenos2:
@@ -326,22 +402,28 @@ class QAGenerator:
         unique2 = phenos2 - phenos1
 
         question = f"Compare the knockout phenotypes of {g1} and {g2}."
+        shared_display = [self._display(p) for p in list(shared)[:3]]
         shared_str = (
-            "share the following phenotypes: " + ", ".join(list(shared)[:3])
+            "share the following phenotypes: " + ", ".join(shared_display)
             if shared else "do not share obvious phenotypes"
         )
+        unique1_display = [self._display(p) for p in list(unique1)[:3]]
+        unique2_display = [self._display(p) for p in list(unique2)[:3]]
         answer = (
             f"Knockout comparison of {g1} vs {g2}:\n\n"
             f"• Shared: Both {g1} and {g2} {shared_str}.\n"
-            f"• {g1}-specific: {', '.join(list(unique1)[:3]) or 'none identified'}.\n"
-            f"• {g2}-specific: {', '.join(list(unique2)[:3]) or 'none identified'}.\n\n"
+            f"• {g1}-specific: {', '.join(unique1_display) or 'none identified'}.\n"
+            f"• {g2}-specific: {', '.join(unique2_display) or 'none identified'}.\n\n"
             f"This comparison reveals both convergent and divergent biological roles "
             f"of these two genes."
         )
         return {
             "question": question,
             "answer": answer,
-            "entities": [g1, g2] + list(shared)[:2] + list(unique1)[:1] + list(unique2)[:1],
+            "entities": [g1, g2]
+            + [self.id2entity[p] for p in list(shared)[:2]]
+            + [self.id2entity[p] for p in list(unique1)[:1]]
+            + [self.id2entity[p] for p in list(unique2)[:1]],
         }
 
     def _entities_of_type(self, type_id: int) -> List[int]:

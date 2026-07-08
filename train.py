@@ -365,11 +365,13 @@ def parse_args():
 def run_eval(cfg: Dict) -> None:
     from src.training.stage3_lora import _run_generation_eval
     from src.models.biokg_lora import BioKGLoRA
+    from src.utils.model_profile import resolve_model_profile
     from transformers import AutoTokenizer
     from src.utils.entity_linker import EntityLinker
 
     paths = cfg["paths"]
     lora_cfg = cfg["lora"]
+    model_profile = resolve_model_profile(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_dir = Path(paths["checkpoints"]["lora"])
     kg_dir = Path(paths["data_root"]) / "kg"
@@ -385,7 +387,14 @@ def run_eval(cfg: Dict) -> None:
         base_model_name=lora_cfg["base_model"],
         kg_embedding_path=str(kg_dir / "entity_embeddings.pt"),
         entity2id_path=entity2id_path,
+        kg_dim=cfg["projection"]["kg_dim"],
+        lm_dim=model_profile["lm_dim"],
+        kg_weight=lora_cfg.get("kg_weight", 0.3),
+        lora_rank=lora_cfg["lora_rank"],
+        lora_alpha=lora_cfg["lora_alpha"],
+        lora_dropout=lora_cfg["lora_dropout"],
         quantization=lora_cfg.get("quantization"),
+        target_modules=model_profile["target_modules"],
     )
     model.eval()
     _run_generation_eval(model, tokenizer,
@@ -397,11 +406,13 @@ def run_eval(cfg: Dict) -> None:
 
 def run_predict(question: str, cfg: Dict) -> None:
     from src.models.biokg_lora import BioKGLoRA
+    from src.utils.model_profile import resolve_model_profile
     from transformers import AutoTokenizer
     from src.utils.entity_linker import EntityLinker
 
     paths = cfg["paths"]
     lora_cfg = cfg["lora"]
+    model_profile = resolve_model_profile(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     kg_dir = Path(paths["data_root"]) / "kg"
     ckpt_dir = Path(paths["checkpoints"]["lora"])
@@ -417,7 +428,14 @@ def run_predict(question: str, cfg: Dict) -> None:
         base_model_name=lora_cfg["base_model"],
         kg_embedding_path=str(kg_dir / "entity_embeddings.pt"),
         entity2id_path=entity2id_path,
+        kg_dim=cfg["projection"]["kg_dim"],
+        lm_dim=model_profile["lm_dim"],
+        kg_weight=lora_cfg.get("kg_weight", 0.3),
+        lora_rank=lora_cfg["lora_rank"],
+        lora_alpha=lora_cfg["lora_alpha"],
+        lora_dropout=lora_cfg["lora_dropout"],
         quantization=lora_cfg.get("quantization"),
+        target_modules=model_profile["target_modules"],
     )
     model.eval()
 
@@ -433,6 +451,9 @@ def run_predict(question: str, cfg: Dict) -> None:
         temperature=gen_cfg.get("temperature", 0.7),
         top_p=gen_cfg.get("top_p", 0.9),
         do_sample=gen_cfg.get("do_sample", True),
+        repetition_penalty=gen_cfg.get("repetition_penalty", 1.3),
+        no_repeat_ngram_size=gen_cfg.get("no_repeat_ngram_size", 3),
+        eos_token_id=tokenizer.eos_token_id,
     )
     answer = tokenizer.decode(out_ids[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
     print(f"\n{'='*60}\nQuestion: {question}\n{'-'*60}\nAnswer:\n{answer}\n{'='*60}")

@@ -75,6 +75,13 @@ def run(cfg: Dict) -> None:
     else:
         logger.warning("GO OBO file not found: %s — skipping", go_obo)
 
+    # ── 4b. Phenotype (MPO) Names ────────────────────────────────────────────
+    mpo_obo = Path(raw["go"]) / "mpo.obo"
+    if mpo_obo.exists():
+        builder.load_phenotype_names(str(mpo_obo))
+    else:
+        logger.warning("MPO OBO file not found: %s — skipping phenotype names", mpo_obo)
+
     # ── 5. KEGG Pathways ─────────────────────────────────────────────────────
     kegg_file = Path(raw["kegg"]) / "mmu_pathway_genes.txt"
     if kegg_file.exists():
@@ -152,6 +159,7 @@ def _generate_qa(builder, cfg: Dict) -> None:
         relation2id=builder.relation2id,
         triples=triples,
         entity_types=builder.entity_type,
+        entity_names=builder.entity_names,
         seed=cfg["hardware"].get("seed", 42),
     )
 

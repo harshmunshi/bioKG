@@ -74,7 +74,10 @@ class BioQADataset(Dataset):
         question = sample["question"]
         answer = sample["answer"]
 
-        full_text = PROMPT_TEMPLATE.format(question=question, answer=answer)
+        # Append EOS so the model learns to stop generating after the answer —
+        # without it, nothing in training ever signals "end here", and at
+        # inference generation runs past the real answer into degenerate loops.
+        full_text = PROMPT_TEMPLATE.format(question=question, answer=answer) + self.tokenizer.eos_token
         question_part = PROMPT_TEMPLATE.format(question=question, answer="").rstrip()
 
         # Tokenise full text

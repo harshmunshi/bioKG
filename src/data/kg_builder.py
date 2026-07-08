@@ -71,6 +71,7 @@ class KGBuilder:
         self.cfg = cfg or {}
         self.entity2id: Dict[str, int] = {}
         self.entity_type: Dict[int, int] = {}       # entity_id → type_id
+        self.entity_names: Dict[int, str] = {}       # entity_id → human-readable name
         self.relation2id: Dict[str, int] = RELATION_TYPES.copy()
         self.triples: List[Tuple[int, int, int]] = []  # (head, rel, tail)
         self._triple_set: set = set()  # de-dup
@@ -83,6 +84,17 @@ class KGBuilder:
             self.entity2id[name] = eid
             self.entity_type[eid] = ENTITY_TYPES[entity_type]
         return self.entity2id[name]
+
+    def _set_name(self, entity_key: str, display_name: str) -> None:
+        """Attach a human-readable name to an already-registered entity.
+
+        Ontology codes (MP:XXXXXXX, GO:XXXXXXX) carry no biological meaning on
+        their own — without this, QA generation and answer formatting can only
+        ever reference the bare code.
+        """
+        eid = self.entity2id.get(entity_key)
+        if eid is not None and display_name:
+            self.entity_names[eid] = display_name
 
     def _add_triple(self, head: str, relation: str, tail: str) -> None:
         if head not in self.entity2id or tail not in self.entity2id:
@@ -211,6 +223,7 @@ class KGBuilder:
         for go_id, data in go_graph.nodes(data=True):
             if go_id not in self.entity2id:
                 continue
+            self._set_name(go_id, data.get("name"))
             for parent_id in data.get("is_a", []):
                 # is_a entries look like "GO:XXXXXXX ! label"
                 pid = parent_id.split(" ")[0].strip()
@@ -219,6 +232,29 @@ class KGBuilder:
                     self._add_triple(pid, "has_part", go_id)
                     added += 1
         logger.info("  Added %d GO hierarchy triples", added)
+
+    def load_phenotype_names(self, obo_path: str) -> None:
+        """
+        Parse mpo.obo (Mammalian Phenotype Ontology) to attach a human-readable
+        name to every MP: code already registered via load_mgi_phenotypes.
+        Without this, phenotypes are only ever referenceable as bare codes
+        (e.g. "MP:0005397") with no biological meaning attached.
+        Requires: obonet (pip install obonet)
+        """
+        logger.info("Loading phenotype names from %s", obo_path)
+        try:
+            import obonet
+        except ImportError:
+            logger.warning("obonet not installed — skipping phenotype names. pip install obonet")
+            return
+        mp_graph = obonet.read_obo(obo_path)
+        named = 0
+        for mp_id, data in mp_graph.nodes(data=True):
+            if mp_id not in self.entity2id:
+                continue
+            self._set_name(mp_id, data.get("name"))
+            named += 1
+        logger.info("  Named %d phenotype entities", named)
 
     def load_kegg_pathways(self, path: str) -> None:
         """
@@ -351,6 +387,8 @@ class KGBuilder:
             json.dump(self.relation2id, f)
         with open(out / "entity_types.json", "w") as f:
             json.dump({str(k): v for k, v in self.entity_type.items()}, f)
+        with open(out / "entity_names.json", "w") as f:
+            json.dump({str(k): v for k, v in self.entity_names.items()}, f)
 
         # Save splits
         train, val, test = self.split_triples(val_ratio, test_ratio)

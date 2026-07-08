@@ -11,7 +11,7 @@ _FALLBACK_PROFILES: Dict[str, Dict[str, Any]] = {
         "target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
     },
     "google/gemma-4-e2b-it": {
-        "lm_dim": 2048,
+        "lm_dim": 1536,
         "target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
     },
 }

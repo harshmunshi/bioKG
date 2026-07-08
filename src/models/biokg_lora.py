@@ -63,6 +63,7 @@ class BioKGLoRA(nn.Module):
         lora_dropout: float = 0.05,
         quantization: Optional[str] = "4bit",
         target_modules: Optional[List[str]] = None,
+        apply_lora: bool = True,
     ):
         super().__init__()
         self.kg_weight = kg_weight
@@ -93,10 +94,18 @@ class BioKGLoRA(nn.Module):
         self.kg_projection = self.kg_projection.to(embedding_device)
 
         # ── 4. Apply LoRA adapters ───────────────────────────────────────────
-        _target_modules = target_modules or ["q_proj", "v_proj", "k_proj", "o_proj"]
-        self.base_llm = self._apply_lora(
-            self.base_llm, lora_rank, lora_alpha, lora_dropout, _target_modules
-        )
+        # target_modules=None lets PEFT pick its own architecture-aware defaults
+        # (needed for Gemma-4: its non-text submodules use a custom
+        # Gemma4ClippableLinear class that a hardcoded ["q_proj", ...] list would
+        # incorrectly match — see https://github.com/huggingface/peft/issues/3129).
+        # apply_lora=False (used by load_for_inference) skips this: a trained
+        # adapter gets loaded via PeftModel.from_pretrained instead, which builds
+        # its own LoRA wrap from adapter_config.json — applying both would nest
+        # PEFT wrapping twice and corrupt every loaded weight's key path.
+        if apply_lora:
+            self.base_llm = self._apply_lora(
+                self.base_llm, lora_rank, lora_alpha, lora_dropout, target_modules
+            )
 
     # ── Loading helpers ───────────────────────────────────────────────────────
 
@@ -136,7 +145,7 @@ class BioKGLoRA(nn.Module):
         )
 
     @staticmethod
-    def _apply_lora(model, rank: int, alpha: int, dropout: float, target_modules: List[str]):
+    def _apply_lora(model, rank: int, alpha: int, dropout: float, target_modules: Optional[List[str]]):
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
         # Prepare quantised model for training
@@ -153,6 +162,54 @@ class BioKGLoRA(nn.Module):
         model = get_peft_model(model, lora_cfg)
         model.print_trainable_parameters()
         return model
+
+    # ── Per-layer embeddings (Gemma-4-specific) ─────────────────────────────────
+
+    @staticmethod
+    def _unwrap_to_backbone(model: nn.Module) -> Optional[nn.Module]:
+        """
+        Walk down through PEFT's wrapping (PeftModel -> LoraModel -> ...) and,
+        for multimodal checkpoints, into `.language_model`, to find the actual
+        backbone module that exposes `get_per_layer_inputs` (Gemma-4's
+        Per-Layer Embeddings). `google/gemma-4-e2b-it` loads as a multimodal
+        wrapper (vision/audio/text) even though we only use it for text, so
+        the text backbone sits under `.model.language_model`, not directly
+        under `.model`. Returns None for architectures without PLE (e.g.
+        Llama) or if the expected attribute chain isn't found.
+        """
+        seen = set()
+        obj = model
+        for _ in range(8):
+            if hasattr(obj, "get_per_layer_inputs"):
+                return obj
+            nxt = None
+            for attr in ("base_model", "model", "language_model"):
+                candidate = getattr(obj, attr, None)
+                if candidate is not None and candidate is not obj and id(candidate) not in seen:
+                    nxt = candidate
+                    break
+            if nxt is None:
+                return None
+            seen.add(id(nxt))
+            obj = nxt
+        return None
+
+    def _get_per_layer_inputs(self, input_ids: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Precompute Gemma-4's Per-Layer Embeddings from the real, unmodified
+        `input_ids` — before KG fusion overwrites `inputs_embeds` at entity-span
+        positions. This must happen with real input_ids: if the model instead
+        has to derive them from (KG-augmented) inputs_embeds, it reverse-looks-up
+        every position against the full vocab embedding table, which both
+        explodes memory (O(batch * seq_len * vocab_size * hidden_size)) and
+        produces wrong results wherever we've overwritten the embedding.
+        Returns None for architectures without this feature (e.g. Llama).
+        """
+        backbone = self._unwrap_to_backbone(self.base_llm)
+        if backbone is None or not getattr(backbone, "hidden_size_per_layer_input", None):
+            return None
+        with torch.no_grad():
+            return backbone.get_per_layer_inputs(input_ids=input_ids, inputs_embeds=None)
 
     # ── Forward pass ─────────────────────────────────────────────────────────
 
@@ -179,16 +236,23 @@ class BioKGLoRA(nn.Module):
         # Get base token embeddings
         inputs_embeds = self.base_llm.get_input_embeddings()(input_ids)   # (B, L, d)
 
+        # Precompute from real input_ids before KG fusion touches inputs_embeds
+        per_layer_inputs = self._get_per_layer_inputs(input_ids)
+
         # Augment with KG embeddings where entity spans are provided
         if entity_spans is not None and len(self.entity2id) > 0:
             inputs_embeds = self._augment_with_kg(inputs_embeds, entity_spans)
 
-        outputs = self.base_llm(
+        forward_kwargs = dict(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             labels=labels,
             return_dict=True,
         )
+        if per_layer_inputs is not None:
+            forward_kwargs["per_layer_inputs"] = per_layer_inputs
+
+        outputs = self.base_llm(**forward_kwargs)
         return outputs
 
     def _augment_with_kg(
@@ -227,20 +291,44 @@ class BioKGLoRA(nn.Module):
         temperature: float = 0.7,
         top_p: float = 0.9,
         do_sample: bool = True,
+        repetition_penalty: float = 1.3,
+        no_repeat_ngram_size: int = 3,
+        eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
-        """Generate tokens with KG-augmented input embeddings."""
+        """Generate tokens with KG-augmented input embeddings.
+
+        repetition_penalty / no_repeat_ngram_size default to values that curb
+        degenerate repetition loops — relevant because training data has no
+        explicit EOS signal on older checkpoints, so the model doesn't reliably
+        know when to stop and can drift into repeating phrases indefinitely.
+        """
         inputs_embeds = self.base_llm.get_input_embeddings()(input_ids)
+
+        # Precompute from real input_ids before KG fusion touches inputs_embeds.
+        # Only the prompt's first forward pass needs this — once past_key_values
+        # exist, subsequent decoding steps use the real id of each newly
+        # generated token and compute their own per-layer input normally.
+        per_layer_inputs = self._get_per_layer_inputs(input_ids)
+
         if entity_spans is not None and len(self.entity2id) > 0:
             inputs_embeds = self._augment_with_kg(inputs_embeds, entity_spans)
 
-        return self.base_llm.generate(
+        generate_kwargs = dict(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
             do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
         )
+        if per_layer_inputs is not None:
+            generate_kwargs["per_layer_inputs"] = per_layer_inputs
+        if eos_token_id is not None:
+            generate_kwargs["eos_token_id"] = eos_token_id
+
+        return self.base_llm.generate(**generate_kwargs)
 
     # ── Parameter groups ──────────────────────────────────────────────────────
 
@@ -274,9 +362,12 @@ class BioKGLoRA(nn.Module):
             kg_embedding_path=kg_embedding_path,
             entity2id_path=entity2id_path,
             projection_ckpt=projection_ckpt or str(Path(adapter_dir) / "projection.pt"),
+            apply_lora=False,
             **kwargs,
         )
-        # Re-load LoRA adapters on top of the freshly initialised base
+        # Wrap with the trained LoRA adapter (single wrap — __init__ skipped its
+        # own via apply_lora=False, so this builds the LoRA structure from
+        # adapter_config.json and loads the matching trained weights into it).
         model.base_llm = PeftModel.from_pretrained(
             model.base_llm, str(Path(adapter_dir) / "lora_adapters")
         )
